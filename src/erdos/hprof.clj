@@ -4,20 +4,15 @@
 
 (set! *warn-on-reflection* true)
 
-;; this is an ugly hack
+
 (declare +oop-size+ +data-input-stream+ +read-bytes+)
 (declare read-int read-long read-byte read-unsigned-byte read-short read-unsigned-short read-char read-float read-double)
+
 ;; specification
 ;; 
 ;; https://github.com/unofficial-openjdk/openjdk/blob/60b7a8f8661234c389e247942a0012da30146a57/src/hotspot/share/services/heapDumper.cpp#L58
 
-;; (def ^:dynamic ^java.io.DataInputStream *data-input-stream* nil)
-; (def ^:dynamic *read-bytes* (volatile! 0))
-
-(def dis-param ^java.io.DataInputStream (quote ^java.io.DataInputStream +data-input-stream+))
-
-(defmacro ^:private def-reader-1 [method]
-  `(~method ~dis-param))
+(def ^:private dis-param ^java.io.DataInputStream (quote ^java.io.DataInputStream +data-input-stream+))
 
 (defmacro ^:private def-reader-2 [method bytes]
   (assert (contains? &env '+read-bytes+))
@@ -25,7 +20,10 @@
        (~method ~dis-param)))
 
 (defmacro ^:private def-reader [name bytes method]
-  `(defmacro ~name [] (if (contains? ~'&env '~'+read-bytes+) (list 'def-reader-2 '~method ~bytes) (list 'def-reader-1 '~method))))
+  `(defmacro ~name []
+     (if (contains? ~'&env '~'+read-bytes+)
+       (list 'def-reader-2 '~method ~bytes)
+       (list '~method dis-param))))
 
 (def-reader read-int 4 .readInt)
 (def-reader read-long 8 .readLong)
@@ -339,16 +337,14 @@
 
 (defn read-hprof-seq [input-stream]
   (let [+data-input-stream+ (new java.io.DataInputStream input-stream)]
-    (println "before reading header")
     (assert (= "JAVA PROFILE 1.0.2" (read-string-literal +data-input-stream+)))
-    (println "header read")
     (let [id-size    (read-int)
           timestamp  (read-long)]
       (read-record+subrecords +data-input-stream+ id-size))))
 
 (defn read-hprof-file [input]
   (with-open [istream (new java.io.DataInputStream (io/input-stream input))]
-    (dorun (read-hprof-seq istream))))
+    (run! println (read-hprof-seq istream))))
 
 (defn -main [& args]
   (println :!)
