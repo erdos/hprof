@@ -5,29 +5,27 @@
 (set! *warn-on-reflection* true)
 
 ;; this is an ugly hack
-(declare +oop-size+)
-
+(declare +oop-size+ +data-input-stream+ +read-bytes+)
+(declare read-int read-long read-byte read-unsigned-byte read-short read-unsigned-short read-char read-float read-double)
 ;; specification
 ;; 
 ;; https://github.com/unofficial-openjdk/openjdk/blob/60b7a8f8661234c389e247942a0012da30146a57/src/hotspot/share/services/heapDumper.cpp#L58
 
-(def ^:dynamic ^java.io.DataInputStream *data-input-stream* nil)
+;; (def ^:dynamic ^java.io.DataInputStream *data-input-stream* nil)
 ; (def ^:dynamic *read-bytes* (volatile! 0))
 
+(def dis-param ^java.io.DataInputStream (quote ^java.io.DataInputStream +data-input-stream+))
+
 (defmacro ^:private def-reader-1 [method]
-  `(~method *data-input-stream*))
+  `(~method ~dis-param))
 
 (defmacro ^:private def-reader-2 [method bytes]
   (assert (contains? &env '+read-bytes+))
   `(do (vswap! ~'+read-bytes+ + ~bytes)
-       (~method *data-input-stream*)))
+       (~method ~dis-param)))
 
-(defmacro def-reader [name bytes method]
-  `(defmacro ~name []
-     ; (println :! ~'&env)
-     (if (contains? ~'&env '~'+read-bytes+)
-       (list 'def-reader-2 '~method ~bytes)
-       (list 'def-reader-1 '~method))))
+(defmacro ^:private def-reader [name bytes method]
+  `(defmacro ~name [] (if (contains? ~'&env '~'+read-bytes+) (list 'def-reader-2 '~method ~bytes) (list 'def-reader-1 '~method))))
 
 (def-reader read-int 4 .readInt)
 (def-reader read-long 8 .readLong)
@@ -39,31 +37,19 @@
 (def-reader read-float 4 .readFloat)
 (def-reader read-double 8 .readDouble)
 
-(comment
-  (defmacro read-int [] `(do (vswap! +read-bytes+ + 4) (.readInt *data-input-stream*)))
-  (defmacro read-long [] `(do (vswap! +read-bytes+ + 8) (.readLong *data-input-stream*)))
-  (defmacro read-byte [] `(do (vswap! +read-bytes+ inc) (.readByte *data-input-stream*)))
-  (defmacro read-unsigned-byte [] `(do (vswap! +read-bytes+ inc) (.readUnsignedByte *data-input-stream*)))
-  (defmacro read-short [] `(do (vswap! +read-bytes+ + 2) (.readShort *data-input-stream*)))
-  (defmacro read-unsigned-short [] `(do (vswap! +read-bytes+ + 2) (.readUnsignedShort *data-input-stream*)))
-  (defmacro read-char [] `(do (vswap! +read-bytes+ + 2) (.readChar *data-input-stream*)))
-  (defmacro read-float [] `(do (vswap! +read-bytes+ + 4) (.readFloat *data-input-stream*)))
-  (defmacro read-double [] `(do (vswap! +read-bytes+ + 8) (.readDouble *data-input-stream*)))  
-  )
-
 (defmacro read-id []
   `(case (int ~'+oop-size+)
      4 (read-int)
      8 (read-long)))
 
 (defn- read-string-literal
-  ([len]
+  ([^java.io.DataInputStream +data-input-stream+ len]
    ;; read string of length
    (let [b (byte-array len)]
      (dotimes [i len]
        (aset b i (read-byte)))
      (new String b)))
-  ([]
+  ([^java.io.DataInputStream +data-input-stream+]
    ;; read 0-terminated string
    (loop [c (read-byte)
           bb (java.nio.ByteBuffer/allocate 18)]
@@ -71,7 +57,7 @@
        (new String (.array bb))
        (recur (read-byte) (.put bb c))))))
 
-(defn- read-of-type [type +oop-size+ +read-bytes+]
+(defn- read-of-type [type ^java.io.DataInputStream +data-input-stream+ +oop-size+ +read-bytes+]
   (case (int type)
     2 (read-id)
     4 (read-byte)
@@ -84,7 +70,7 @@
     11 (read-long)
     (throw (ex-info "Could not read for type " {:type type}))))
 
-(defn- read-pair [+oop-size+ +read-bytes+]
+(defn- read-pair [^java.io.DataInputStream +data-input-stream+ +oop-size+ +read-bytes+]
   (let [t (read-unsigned-byte)]
     {:type (case t
              2 :object
@@ -96,7 +82,7 @@
              9 :short
              10 :int
              11 :long)
-     :value (read-of-type t +oop-size+ +read-bytes+)}))
+     :value (read-of-type t +data-input-stream+ +oop-size+ +read-bytes+)}))
 
 (def ^:private record-readers (vec (repeat 255 nil)))
 (defmacro ^:private def-read-record [rectype hex body]
@@ -104,21 +90,21 @@
   (assert (integer? hex))
   `(alter-var-root #'record-readers
                    assoc ~hex
-                   (fn [~'+oop-size+] (assoc ~body :record/type ~(keyword (name rectype))))))
+                   (fn [~dis-param ~'+oop-size+] (assoc ~body :record/type ~(keyword (name rectype))))))
 
 (def ^:private sub-record-readers (vec (repeat 255 nil)))
 (defmacro ^:private def-read-sub-record [rectype hex body]
   (assert (keyword? rectype))
   (assert (integer? hex))
   `(alter-var-root #'sub-record-readers
-                   assoc ~hex (fn [~'+oop-size+ ~'+read-bytes+] (-> ~body (assoc :record/type ~(keyword (name rectype)))))))
+                   assoc ~hex (fn [~dis-param ~'+oop-size+ ~'+read-bytes+] (-> ~body (assoc :record/type ~(keyword (name rectype)))))))
 
 (def-read-record :HPROF_UTF8 0x01
   (let [timestamp (read-int)
         len (read-int)]
     (assert (= 0 timestamp))
     {:record/id (read-id)
-     :record/utf8 (-> len (- +oop-size+) read-string-literal)}))
+     :record/utf8 (-> len (- +oop-size+) (->> (read-string-literal +data-input-stream+)))}))
 
 (def-read-record :HPROF_LOAD_CLASS 0x02
   (let [[timestamp len] [(read-int) (read-int)]
@@ -249,11 +235,11 @@
         instance-size (read-int) ;; instance size in bytes
         cp (doall (for [_ (range (read-unsigned-short))
                         :let [idx (read-short)]]
-                    (assoc (read-pair +oop-size+ +read-bytes+)
+                    (assoc (read-pair +data-input-stream+ +oop-size+ +read-bytes+)
                            :ip-idx idx)))
         statics (doall (for [_ (range (read-unsigned-short))
                              :let [id (read-id)]]
-                         (assoc (read-pair +oop-size+ +read-bytes+)
+                         (assoc (read-pair +data-input-stream+ +oop-size+ +read-bytes+)
                                 :id id)))
         inst (doall (for [_ (range (read-unsigned-short))]
                       {:id (read-id)
@@ -300,41 +286,41 @@
         ss (read-int)
         nr (read-int)
         type (read-unsigned-byte)
-        elements (vec (repeatedly nr #(read-of-type type +oop-size+ +read-bytes+)))]
+        elements (vec (repeatedly nr #(read-of-type type +data-input-stream+ +oop-size+ +read-bytes+)))]
     {:array-object-id id
      :stack-trace-serial-nr ss
      :elements elements}))
 
-(defn read-sub-record [+oop-size+]
+(defn read-sub-record [^java.io.DataInputStream +data-input-stream+ +oop-size+]
   (let [+read-bytes+ (volatile! 0)
         b (int (read-byte))]
     (if-let [r (get sub-record-readers b +read-bytes+)]
-      (assoc (r +oop-size+ +read-bytes+) :record/length @+read-bytes+)
+      (assoc (r +data-input-stream+ +oop-size+ +read-bytes+) :record/length @+read-bytes+)
       (throw (ex-info (str "No reader for subrecord " b) {})))))
 
 ;; read n bytes of subrecords
-(defn- read-sub-records-of-bytes [byte-count oop-size]
+(defn- read-sub-records-of-bytes [^java.io.DataInputStream +data-input-stream+ byte-count oop-size]
   (cond (zero? byte-count) []
         (neg? byte-count)  (assert false)
-        :else (let [head (read-sub-record oop-size)]
-                (cons head (lazy-seq (read-sub-records-of-bytes (- byte-count (:record/length head)) oop-size))))))
+        :else (let [head (read-sub-record +data-input-stream+ oop-size)]
+                (cons head (lazy-seq (read-sub-records-of-bytes +data-input-stream+ (- byte-count (:record/length head)) oop-size))))))
 
-(defn read-record [+oop-size+]
+(defn read-record [^java.io.DataInputStream +data-input-stream+ +oop-size+]
   (let [b (int (read-byte))]
     (if-let [r (get record-readers b)]
-      (r +oop-size+)
+      (r +data-input-stream+ +oop-size+)
       (throw (ex-info (str "Can not find reader for byte " (int b)) {:byte b})))))
 
-(defn- read-record+subrecords [oop-size]
-  (when (pos? (.available *data-input-stream*))
-    (let [head (read-record oop-size)]
+(defn- read-record+subrecords [+data-input-stream+ oop-size]
+  (when (pos? (.available ^java.io.DataInputStream +data-input-stream+))
+    (let [head (read-record +data-input-stream+ oop-size)]
       (case (:record/type head)
         (:HPROF_HEAP_DUMP :HPROF_HEAP_DUMP_SEGMENT)
         (lazy-cat [head]
-                  (read-sub-records-of-bytes (:record/length head) oop-size)
-                  (read-record+subrecords oop-size))
+                  (read-sub-records-of-bytes +data-input-stream+ (:record/length head) oop-size)
+                  (read-record+subrecords +data-input-stream+ oop-size))
         ;; else
-        (cons head (lazy-seq (read-record+subrecords oop-size)))))))
+        (cons head (lazy-seq (read-record+subrecords +data-input-stream+ oop-size)))))))
 
 ;; TODO: use it to field instance field values properly.
 #_(defn- map-instance-fields
@@ -351,20 +337,18 @@
              :else
              (cons head (lazy-seq (map-instance-fields id->class tail)))))))
 
+(defn read-hprof-seq [input-stream]
+  (let [+data-input-stream+ (new java.io.DataInputStream input-stream)]
+    (println "before reading header")
+    (assert (= "JAVA PROFILE 1.0.2" (read-string-literal +data-input-stream+)))
+    (println "header read")
+    (let [id-size    (read-int)
+          timestamp  (read-long)]
+      (read-record+subrecords +data-input-stream+ id-size))))
+
 (defn read-hprof-file [input]
-  (with-open [reader (new java.io.DataInputStream (io/input-stream input))]
-    (binding [*data-input-stream* reader]
-      (println "before reading header")
-      (assert (= "JAVA PROFILE 1.0.2" (read-string-literal)))
-      (println "header read")
-      (let [id-size    (read-int)
-            timestamp  (read-long)]
-        (println :id-size id-size :timestamp timestamp)
-        (->> (read-record+subrecords id-size)
-             #_(drop-while (comp #{:HPROF_UTF8 :HPROF_FRAME :HPROF_LOAD_CLASS :HPROF_TRACE
-                                   :HPROF_GC_CLASS_DUMP} :record/type))
-             #_(run! println)
-             (dorun))))))
+  (with-open [istream (new java.io.DataInputStream (io/input-stream input))]
+    (dorun (read-hprof-seq istream))))
 
 (defn -main [& args]
   (println :!)
