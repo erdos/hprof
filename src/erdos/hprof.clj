@@ -70,18 +70,21 @@
     11 (read-long)
     (throw (ex-info "Could not read for type " {:type type}))))
 
+(defn- type->kw [type-byte]
+  (case type-byte
+    2 :object
+    4 :boolean
+    5 :char
+    6 :float
+    7 :double
+    8 :byte
+    9 :short
+    10 :int
+    11 :long))
+
 (defn- read-pair [^java.io.DataInputStream +data-input-stream+ +oop-size+ +read-bytes+]
   (let [t (read-unsigned-byte)]
-    {:type (case t
-             2 :object
-             4 :boolean
-             5 :char
-             6 :float
-             7 :double
-             8 :byte
-             9 :short
-             10 :int
-             11 :long)
+    {:type (type->kw t)
      :value (read-of-type t +data-input-stream+ +oop-size+ +read-bytes+)}))
 
 (def ^:private record-readers (vec (repeat 255 nil)))
@@ -242,8 +245,8 @@
                          (assoc (read-pair +data-input-stream+ +oop-size+ +read-bytes+)
                                 :id id)))
         inst (doall (for [_ (range (read-unsigned-short))]
-                      {:id (read-id)
-                       :type (read-unsigned-byte)}))]
+                      {:field-id (read-id)
+                       :type (type->kw (read-unsigned-byte))}))]
     {:class-object-id id
      :stack-trace-serial-nr stsn
      :super-class-object-id sc-id
@@ -330,6 +333,10 @@
                             (dissoc :class-name-id)
                             (assoc :class-name (get strings (:class-name-id head)))
                             (cons (lazy-seq (map-string-vals strings tail))))
+      :HPROF_GC_CLASS_DUMP (-> head
+                               ;; TODO: maybe rm id?
+                               (update :inst (fn [xs] (mapv (fn [x] (assoc x :name (get strings (:field-id x)))) xs)))                               
+                               (cons (lazy-seq (map-string-vals strings tail))))
       :HPROF_FRAME      (-> head
                             (dissoc :method-name-id :source-file-name-id)
                             (assoc :method-name (get strings (:method-name-id head))
@@ -338,6 +345,17 @@
       ;; else
       (cons head (lazy-seq (map-string-vals strings tail))))))
 
+(defn map-class-names [classnames records]
+  (when-let [[head & tail] (seq records)]
+    (case (:record/type head)
+      :HPROF_LOAD_CLASS (cons head (lazy-seq (map-class-names (assoc classnames (:class-object-id head) (:class-name head)) tail)))
+      :HPROF_GC_CLASS_DUMP (-> head
+                               (assoc :class-name (get classnames (:class-object-id head))
+                                      :super-class-name (get classnames (:super-class-object-id head)))
+                               (cons (lazy-seq (map-class-names classnames tail))))
+      ;; else
+      (cons head (lazy-seq (map-class-names classnames tail))))))
+
 ;; TODO: write mapper for instance fields!
 
 (defn read-hprof-seq [input-stream]
@@ -345,13 +363,13 @@
     (assert (= "JAVA PROFILE 1.0.2" (read-string-literal +data-input-stream+)))
     (let [id-size    (read-int)
           timestamp  (read-long)]
-      (read-record+subrecords +data-input-stream+ id-size))))
+      (->> (read-record+subrecords +data-input-stream+ id-size)
+           (map-string-vals {})
+           (map-class-names {})))))
 
 (defn read-hprof-file [input]
   (with-open [istream (new java.io.DataInputStream (io/input-stream input))]
-    (->> (read-hprof-seq istream)
-         (map-string-vals {})
-         (run! empty?))))
+    (run! println (read-hprof-seq istream))))
 
 (defn -main [hprof-file]
   (println :!)
