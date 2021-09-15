@@ -143,7 +143,7 @@
         nr-frames             (read-int)
         stack-frame-ids (doall (repeatedly nr-frames #(read-id)))]
     {:stack-trace-serial-nr stack-trace-serial-nr
-     :thread-serial-nnr thread-serial-nr
+     :thread-serial-number thread-serial-nr
      :stack-frame-ids stack-frame-ids}))
 
 ;; a set of heap allocation sites, obtained after GC
@@ -220,7 +220,7 @@
 (def-read-sub-record :HPROF_GC_ROOT_THREAD_OBJ 0x08
   {:thread-object-id (read-id)
    :thread-sequence-number (read-int)
-   :stack-trace-sequence-nummber (read-int)})
+   :stack-trace-sequence-number (read-int)})
 
 ;; dump of class object
 (def-read-sub-record :HPROF_GC_CLASS_DUMP 0x20
@@ -351,7 +351,7 @@
   (with-open [istream (new java.io.DataInputStream (io/input-stream input))]
     (->> (read-hprof-seq istream)
          (map-string-vals {})
-         (run! println))))
+         (run! empty?))))
 
 (defn -main [hprof-file]
   (println :!)
