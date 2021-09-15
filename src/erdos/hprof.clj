@@ -12,7 +12,7 @@
 ;; 
 ;; https://github.com/unofficial-openjdk/openjdk/blob/60b7a8f8661234c389e247942a0012da30146a57/src/hotspot/share/services/heapDumper.cpp#L58
 
-(def ^:private dis-param ^java.io.DataInputStream (quote ^java.io.DataInputStream +data-input-stream+))
+(def ^:private dis-param (quote ^java.io.DataInputStream +data-input-stream+))
 
 (defmacro ^:private def-reader-2 [method bytes]
   (assert (contains? &env '+read-bytes+))
@@ -34,6 +34,8 @@
 (def-reader read-char 2 .readChar)
 (def-reader read-float 4 .readFloat)
 (def-reader read-double 8 .readDouble)
+
+(defmacro read-unsigned-int [] `(Integer/toUnsignedLong (read-int)))
 
 (defmacro read-id []
   `(case (int ~'+oop-size+)
@@ -171,11 +173,11 @@
      :sites (vec sites)}))
 
 (def-read-record :HPROF_HEAP_DUMP 0x0C
-  (let [[timestamp len] [(read-int) (read-int)]]
+  (let [[timestamp len] [(read-int) (read-unsigned-int)]]
     {:record/length len}))
 
 (def-read-record :HPROF_HEAP_DUMP_SEGMENT 0x1C
-  (let [[timestamp len] [(read-int) (read-int)]]
+  (let [[timestamp len] [(read-int) (read-unsigned-int)]]
     {:record/length len}))
 
 (def-read-record :HPROF_HEAP_DUMP_END 0x2C
@@ -299,7 +301,7 @@
 ;; read n bytes of subrecords
 (defn- read-sub-records-of-bytes [^java.io.DataInputStream +data-input-stream+ byte-count oop-size]
   (cond (zero? byte-count) []
-        (neg? byte-count)  (assert false)
+        (neg? byte-count)  (assert false (str "Byte cnt is " byte-count))
         :else (let [head (read-sub-record +data-input-stream+ oop-size)]
                 (cons head (lazy-seq (read-sub-records-of-bytes +data-input-stream+ (- byte-count (:record/length head)) oop-size))))))
 
@@ -320,20 +322,23 @@
         ;; else
         (cons head (lazy-seq (read-record+subrecords +data-input-stream+ oop-size)))))))
 
-;; TODO: use it to field instance field values properly.
-#_(defn- map-instance-fields
-    ([records] (map-instance-fields {} records))
-    ([id->class records]
-     (when-let [[head & tail] (seq records)]
-     ;; if head is a class definition then put it in the 
-       (cond head-is-class-def
-             (cons head (lazy-seq (map-instance-fields (assoc id->class id head) tail)))
+(defn map-string-vals [strings records]
+  (when-let [[head & tail] (seq records)]
+    (case (:record/type head)
+      :HPROF_UTF8       (recur (assoc strings (:record/id head) (:record/utf8 head)) tail)
+      :HPROF_LOAD_CLASS (-> head
+                            (dissoc :class-name-id)
+                            (assoc :class-name (get strings (:class-name-id head)))
+                            (cons (lazy-seq (map-string-vals strings tail))))
+      :HPROF_FRAME      (-> head
+                            (dissoc :method-name-id :source-file-name-id)
+                            (assoc :method-name (get strings (:method-name-id head))
+                                   :source-file-name (get strings (:source-file-name-id head)))
+                            (cons (lazy-seq (map-string-vals strings tail))))
+      ;; else
+      (cons head (lazy-seq (map-string-vals strings tail))))))
 
-             head-is-instance
-           ;; parse fields from head to correct types
-
-             :else
-             (cons head (lazy-seq (map-instance-fields id->class tail)))))))
+;; TODO: write mapper for instance fields!
 
 (defn read-hprof-seq [input-stream]
   (let [+data-input-stream+ (new java.io.DataInputStream input-stream)]
@@ -344,10 +349,11 @@
 
 (defn read-hprof-file [input]
   (with-open [istream (new java.io.DataInputStream (io/input-stream input))]
-    (run! println (read-hprof-seq istream))))
+    (->> (read-hprof-seq istream)
+         (map-string-vals {})
+         (run! println))))
 
-(defn -main [& args]
+(defn -main [hprof-file]
   (println :!)
-  (dorun
-   (read-hprof-file (io/file "/Users/janos.erdos/dump1.hprof")))
+  (read-hprof-file (io/file hprof-file))
   (int 0))
