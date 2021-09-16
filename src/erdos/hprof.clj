@@ -325,36 +325,49 @@
         ;; else
         (cons head (lazy-seq (read-record+subrecords +data-input-stream+ oop-size)))))))
 
-(defn map-string-vals [strings records]
-  (when-let [[head & tail] (seq records)]
-    (case (:record/type head)
-      :HPROF_UTF8       (recur (assoc strings (:record/id head) (:record/utf8 head)) tail)
-      :HPROF_LOAD_CLASS (-> head
-                            (dissoc :class-name-id)
-                            (assoc :class-name (get strings (:class-name-id head)))
-                            (cons (lazy-seq (map-string-vals strings tail))))
-      :HPROF_GC_CLASS_DUMP (-> head
-                               ;; TODO: maybe rm id?
-                               (update :inst (fn [xs] (mapv (fn [x] (assoc x :name (get strings (:field-id x)))) xs)))                               
-                               (cons (lazy-seq (map-string-vals strings tail))))
-      :HPROF_FRAME      (-> head
-                            (dissoc :method-name-id :source-file-name-id)
-                            (assoc :method-name (get strings (:method-name-id head))
-                                   :source-file-name (get strings (:source-file-name-id head)))
-                            (cons (lazy-seq (map-string-vals strings tail))))
-      ;; else
-      (cons head (lazy-seq (map-string-vals strings tail))))))
 
-(defn map-class-names [classnames records]
-  (when-let [[head & tail] (seq records)]
-    (case (:record/type head)
-      :HPROF_LOAD_CLASS (cons head (lazy-seq (map-class-names (assoc classnames (:class-object-id head) (:class-name head)) tail)))
-      :HPROF_GC_CLASS_DUMP (-> head
-                               (assoc :class-name (get classnames (:class-object-id head))
-                                      :super-class-name (get classnames (:super-class-object-id head)))
-                               (cons (lazy-seq (map-class-names classnames tail))))
-      ;; else
-      (cons head (lazy-seq (map-class-names classnames tail))))))
+;; maps over a sequence with mapping both elements and an accumulator record
+(defn- map-with-acc [accum-mapper elem-mapper accumulator xs]
+  ((fn f [accum xs]
+     (when-let [[head & tail] (seq xs)]
+       (let [accum (accum-mapper accum head)
+             head  (elem-mapper accum head)]
+         (cons head (lazy-seq (f accum tail))))))
+   accumulator xs))
+
+(defn map-string-vals [records]
+  (map-with-acc
+   (fn [strings record]
+     (if (= :HPROF_UTF8 (:record/type record))
+       (assoc strings (:record/id record) (:record/utf8 record))
+       strings))
+   (fn [strings record]
+     (case (:record/type record)
+       :HPROF_LOAD_CLASS (-> record
+                             (dissoc :class-name-id)
+                             (assoc :class-name (get strings (:class-name-id record))))
+       :HPROF_GC_CLASS_DUMP (-> record
+                                (update :inst (fn [xs] (mapv (fn [x] (assoc x :name (get strings (:field-id x)))) xs))))
+       :HPROF_FRAME      (-> record
+                             (dissoc :method-name-id :source-file-name-id)
+                             (assoc :method-name (get strings (:method-name-id record))
+                                    :source-file-name (get strings (:source-file-name-id record))))
+       record))
+   {} records))
+
+(defn map-class-names [records]
+  (map-with-acc
+   (fn [classnames elem]
+     (if (= :HPROF_LOAD_CLASS (:record/type elem))
+       (assoc classnames (:class-object-id elem) (:class-name elem))
+       classnames))
+   (fn [classnames elem]
+     (if (= :HPROF_GC_CLASS_DUMP (:record/type elem))
+       (assoc elem
+              :class-name (get classnames (:class-object-id elem))
+              :super-class-name (get classnames (:super-class-object-id elem)))
+       elem))
+   {} records))
 
 ;; TODO: write mapper for instance fields!
 
@@ -364,8 +377,8 @@
     (let [id-size    (read-int)
           timestamp  (read-long)]
       (->> (read-record+subrecords +data-input-stream+ id-size)
-           (map-string-vals {})
-           (map-class-names {})))))
+           (map-string-vals)
+           (map-class-names)))))
 
 (defn read-hprof-file [input]
   (with-open [istream (new java.io.DataInputStream (io/input-stream input))]
