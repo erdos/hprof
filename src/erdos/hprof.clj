@@ -2,8 +2,11 @@
   (:require [clojure.java.io :as io]
             [clojure.pprint]))
 
+(require '[datalevin.core :as datalevin])
+
 (set! *warn-on-reflection* true)
 
+(defmacro !! [x] `(doto ~x assert))
 
 (declare +oop-size+ +data-input-stream+ +read-bytes+)
 (declare read-int read-long read-byte read-unsigned-byte read-short read-unsigned-short read-char read-float read-double)
@@ -68,6 +71,19 @@
     9 (read-short)
     10 (read-int)
     11 (read-long)
+    (throw (ex-info "Could not read for type " {:type type}))))
+
+(defn- read-of-type-kw [type ^java.io.DataInputStream +data-input-stream+ +oop-size+]
+  (case type
+    :object (read-id)
+    :boolean (read-byte)
+    :char (read-char)
+    :float (read-float)
+    :double (read-double)
+    :byte (read-byte)
+    :short (read-short)
+    :int (read-int)
+    :long (read-long)
     (throw (ex-info "Could not read for type " {:type type}))))
 
 (defn- type->kw [type-byte]
@@ -265,7 +281,7 @@
         ss-ss   (read-int)
         cl-id   (read-id)
         size    (read-int) ;; nr of bytes that follow
-        content (vec (repeatedly size #(read-byte))) ;; read n bytes
+        content (byte-array (repeatedly size #(read-byte))) ;; read n bytes
         ]
     {:id id
      :stack-trace-serial-nr ss-ss
@@ -347,11 +363,14 @@
                              (dissoc :class-name-id)
                              (assoc :class-name (get strings (:class-name-id record))))
        :HPROF_GC_CLASS_DUMP (-> record
-                                (update :inst (fn [xs] (mapv (fn [x] (assoc x :name (get strings (:field-id x)))) xs))))
+                                (update :inst (partial mapv (fn [x] (assoc x :name (get strings (:field-id x)))))))
        :HPROF_FRAME      (-> record
                              (dissoc :method-name-id :source-file-name-id)
+                             (cond-> (not= 0 (:source-file-name-id record))
+                               (assoc :source-file-name (strings (:source-file-name-id record))))
                              (assoc :method-name (get strings (:method-name-id record))
-                                    :source-file-name (get strings (:source-file-name-id record))))
+                                    ; :source-file-name (get strings (:source-file-name-id record))
+                                    ))
        record))
    {} records))
 
@@ -364,8 +383,49 @@
    (fn [classnames elem]
      (if (= :HPROF_GC_CLASS_DUMP (:record/type elem))
        (assoc elem
-              :class-name (get classnames (:class-object-id elem))
-              :super-class-name (get classnames (:super-class-object-id elem)))
+              :class-name (!! (classnames (:class-object-id elem)))
+              :super-class-name
+              ;; java.lang.Object does not have a super type
+              (if (zero? (:super-class-object-id elem))
+                "java/lang/Object"
+                (!! (classnames (:super-class-object-id elem)))))
+       elem))
+   {} records))
+
+(defn read-instance-fields [id-size fields content]
+  (assert id-size)
+  (assert fields)
+  (assert content)
+  (let [bis (new java.io.ByteArrayInputStream content)
+        dis (new java.io.DataInputStream bis)]
+    (mapv (fn [field]
+            {:type (:type field)
+             :field-id (:field-id field)
+             :value (read-of-type-kw (:type field) dis id-size)})
+          fields)))
+
+;; super-class-object-id
+;;
+(defn map-instance-fields [id-size records]
+  (map-with-acc
+   ;; for class dump: save field descriptors
+   (fn [class->fields elem]
+     (if (= :HPROF_GC_CLASS_DUMP (:record/type elem))
+       ;; TODO: also collect parent fields!!
+       (assoc class->fields
+              (:class-object-id elem)
+              (concat
+               (when (not= "java/lang/Object" (:class-name elem))
+                (doto (class->fields (:super-class-object-id elem))
+                  (assert  (str "Cannot hande " elem ))))
+               (:inst elem)))
+       class->fields))
+   ;; for instace dumps: parse fields
+   (fn [class->fields elem]
+     (if (= :HPROF_GC_INSTANCE_DUMP (:record/type elem))
+       (-> elem
+           (dissoc :content)
+           (assoc :fields (read-instance-fields id-size (!! (class->fields (:class-object-id elem))) (:content elem))))
        elem))
    {} records))
 
@@ -378,13 +438,28 @@
           timestamp  (read-long)]
       (->> (read-record+subrecords +data-input-stream+ id-size)
            (map-string-vals)
-           (map-class-names)))))
+           (map-class-names)
+           ;(map-instance-fields id-size)
+           ))))
+
+(def schema {:record/id {:db/valueType :db.type/ref, :db.unique :db.unique/identity}
+             })
+
+(def db-conn (datalevin/get-conn "/tmp/hprof-test-2" schema))
 
 (defn read-hprof-file [input]
   (with-open [istream (new java.io.DataInputStream (io/input-stream input))]
-    (run! println (read-hprof-seq istream))))
+    (->> (read-hprof-seq istream)
+         (remove (comp #{:HPROF_UTF8} :record/type))
+         (datalevin/transact! db-conn))
+;;    (run! println (read-hprof-seq istream))
+    :ok
+    ))
+
+
 
 (defn -main [hprof-file]
   (println :!)
   (read-hprof-file (io/file hprof-file))
+  (datalevin/close db-conn)
   (int 0))
